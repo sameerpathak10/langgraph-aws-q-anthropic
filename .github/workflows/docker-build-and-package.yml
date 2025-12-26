@@ -74,6 +74,19 @@ jobs:
           name: lambda-package
           path: langgraph_lambda.zip
 
+      - name: Upload to S3 (optional)
+        if: ${{ secrets.LAMBDA_S3_BUCKET && secrets.LAMBDA_S3_KEY && secrets.AWS_ACCESS_KEY_ID && secrets.AWS_SECRET_ACCESS_KEY }}
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Copy ZIP to S3
+        if: ${{ secrets.LAMBDA_S3_BUCKET && secrets.LAMBDA_S3_KEY && secrets.AWS_ACCESS_KEY_ID && secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 cp langgraph_lambda.zip s3://${{ secrets.LAMBDA_S3_BUCKET }}/${{ secrets.LAMBDA_S3_KEY }}
+
       - name: Upload build directory (optional)
         if: always()
         uses: actions/upload-artifact@v4

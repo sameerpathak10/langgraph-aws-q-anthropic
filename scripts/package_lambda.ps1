@@ -81,6 +81,12 @@ if (Test-Path $RequirementsFile) {
 # Attempt to set permissive ACLs on build dir (best-effort)
 try { icacls $BuildDir /grant *S-1-1-0:(OI)(CI)F } catch { }
 
+# Debug: list build dir contents to help diagnose missing packages
+Write-Host "Debug: listing top-level items in $BuildDir:"
+Get-ChildItem -Path $BuildDir -Force | ForEach-Object { Write-Host "  " + $_.Name }
+Write-Host "Debug: searching for *dist-info and top-level package dirs (first 50 matches):"
+Get-ChildItem -Path $BuildDir -Recurse -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*dist-info' -or $_.Name -match '^[a-zA-Z0-9_\-]+' } | Select-Object -First 50 | ForEach-Object { Write-Host "  " + $_.FullName }
+
 # Validate required modules are present (fail fast if missing)
 $requiredModules = @('langgraph','langchain_core','langchain_aws','boto3')
 foreach ($mod in $requiredModules) {
@@ -90,7 +96,7 @@ foreach ($mod in $requiredModules) {
         Write-Error "Required module '$mod' not found in $BuildDir. Packaging aborted. Please ensure dependencies install successfully or add '$mod' to your slim requirements.";
         exit 1
     }
-}
+} 
 
 # Copy source files (edit if you need more files)
 Write-Host "Copying source files..."
