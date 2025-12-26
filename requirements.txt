@@ -5,7 +5,7 @@ langchain
 # If you need amazon-specific helpers
 # langchain-aws
 # Add your project's packages or vendored libraries here (e.g., langgraph)
-# langgraph
+langgraph==1.0.5
 
 # Tip: pin versions for reproducible builds, e.g.:
 # boto3==1.26.12
