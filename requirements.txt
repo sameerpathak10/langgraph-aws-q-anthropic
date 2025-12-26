@@ -1,0 +1,18 @@
+# Runtime dependencies for the Lambda. Edit and pin versions as needed.
+# Example packages referenced by main.py — replace with correct package names/versions
+boto3
+langchain
+# If you need amazon-specific helpers
+# langchain-aws
+# Add your project's packages or vendored libraries here (e.g., langgraph)
+# langgraph
+
+# Tip: pin versions for reproducible builds, e.g.:
+# boto3==1.26.12
+# langchain==0.1.0
+
+# Binary/compiled dependencies (ensure these are built for Amazon Linux 3 when packaging)
+pydantic
+pydantic-core
+langchain-core
+langchain-aws

@@ -1,0 +1,82 @@
+name: Docker Build & Lambda Package
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*', 'v*.*', 'v*.*.*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Check for Dockerfile
+        id: check-dockerfile
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Login to GitHub Container Registry
+        if: steps.check-dockerfile.outputs.exists == 'true'
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (and optionally push) Docker image
+        if: steps.check-dockerfile.outputs.exists == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+      - name: Run packaging script to produce zip
+        shell: pwsh
+        run: |
+          # ensure script is executable and run it
+          Set-StrictMode -Version Latest
+          ./scripts/package_lambda.ps1 -RequirementsFile requirements.txt -OutputZip langgraph_lambda.zip -BuildDir build
+
+      - name: Upload lambda zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-package
+          path: langgraph_lambda.zip
+
+      - name: Upload build directory (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-directory
+          path: build

@@ -1,0 +1,351 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Creates a Lambda for RAG/LLM routing using the provided `main.py` handler,
+  and provisions an Amazon Q Business Application and User via a Lambda-backed
+  custom resource. Grants the Lambda permissions to call Amazon Q Business
+  and Amazon Bedrock runtime (broad permissions can be tightened later).
+
+Parameters:
+  LambdaS3Bucket:
+    Type: String
+    Default: langgraph-poc-bucket
+    Description: S3 bucket that contains the ZIP package for the main Lambda (code).
+  LambdaS3Key:
+    Type: String
+    Description: S3 key for the ZIP package (e.g., langgraph_lambda.zip).
+    Default: langgraph_lambda.zip
+  LambdaFunctionName:
+    Type: String
+    Default: langgraph-rag-lambda
+    Description: Lambda function name
+  ApplicationName:
+    Type: String
+    Default: LangGraphQApp
+    Description: Display name of the Amazon Q Business application to create
+  ApplicationUserId:
+    Type: String
+    Default: lambda-user
+    Description: User id (external id/email) to create in the Q application
+  ApplicationIdentityType:
+    Type: String
+    Default: ANONYMOUS
+    Description: Identity type to use when creating the Q application. Allowed values AWS_IAM_IDP_SAML, AWS_QUICKSIGHT_IDP, ANONYMOUS, AWS_IAM_IDP_OIDC, AWS_IAM_IDC
+  Runtime:
+    Type: String
+    Default: python3.11
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${LambdaFunctionName}-exec-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: LambdaBasic
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+        - PolicyName: BedrockAndQPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Amazon Bedrock runtime invocation (broad; tighten to least privilege later)
+              - Effect: Allow
+                Action:
+                  - bedrock-runtime:InvokeModel
+                  - bedrock-runtime:InvokeModelWithResponseStream
+                  - bedrock:InvokeModel
+                Resource: "*"
+              # Amazon Q Business chat access for runtime (broad)
+              - Effect: Allow
+                Action:
+                  - qbusiness:ChatSync
+                  - qbusiness:chat_sync
+                  - qbusiness:*
+                Resource: "*"
+
+  AppFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: QProvisionerCustomResource
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Handler: main.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: !Ref Runtime
+      Timeout: 20
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      Environment:
+        Variables:
+          Q_APP_ID: !GetAtt QProvisionerCustomResource.ApplicationId
+          Q_USER_ID: !Ref ApplicationUserId
+      Tags:
+        - Key: project
+          Value: langgraph
+
+  QProvisionerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: QProvisionerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - qbusiness:CreateApplication
+                  - qbusiness:ListApplications
+                  - qbusiness:GetApplication
+                  - qbusiness:CreateUser
+                  - qbusiness:GetUser
+                  - qbusiness:ListUsers
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName: "qbusiness.amazonaws.com"
+
+  QProvisionerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${LambdaFunctionName}-q-provisioner"
+      Handler: index.handler
+      Role: !GetAtt QProvisionerRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.request
+          import urllib.error
+          import logging
+          import traceback
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          q = boto3.client('qbusiness')
+
+          def send_response(event, context, status, data=None, reason=None):
+              resp = {
+                  'Status': status,
+                  'Reason': reason or '',
+                  'PhysicalResourceId': context.log_stream_name if context else 'q-provisioner',
+                  'StackId': event.get('StackId'),
+                  'RequestId': event.get('RequestId'),
+                  'LogicalResourceId': event.get('LogicalResourceId'),
+                  'Data': data or {}
+              }
+              body = json.dumps(resp).encode('utf-8')
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT')
+              req.add_header('Content-Type', '')
+              req.add_header('Content-Length', str(len(body)))
+              try:
+                  urllib.request.urlopen(req)
+              except Exception as e:
+                  logger.exception('Failed to send CFN response')
+
+          import time
+          from botocore.exceptions import ClientError
+
+          def ensure_application(display_name, identity_type='ANONYMOUS'):
+              # Validate input
+              if not display_name:
+                  raise ValueError('ApplicationName must be provided')
+
+              # Try to find an existing application
+              resp = q.list_applications()
+              items = resp.get('applications', [])
+              for a in items:
+                  if a.get('displayName') == display_name:
+                      return a['applicationId']
+
+              # Not found -> create. Use provided identity_type; implement retries and detailed logging.
+              max_attempts = 3
+              for attempt in range(1, max_attempts + 1):
+                  try:
+                      resp = q.create_application(displayName=display_name, identityType=identity_type)
+                      app_id = resp.get('applicationId')
+
+                      # Wait for the application to become ready before returning (poll get_application)
+                      ready = False
+                      wait_attempts = 8
+                      for w in range(wait_attempts):
+                          try:
+                              app_resp = q.get_application(applicationId=app_id)
+                              logger.info('get_application response (attempt %d): %s', w+1, app_resp)
+                              # Try common fields for status/state
+                              status = app_resp.get('status') or (app_resp.get('application') or {}).get('status') or (app_resp.get('application') or {}).get('state')
+                              if status and str(status).upper() in ['ACTIVE','AVAILABLE','READY','CREATED','SUCCEEDED']:
+                                  ready = True
+                                  break
+                              # Fallback: inspect list_applications
+                              apps = q.list_applications()
+                              for a in apps.get('applications', []):
+                                  if a.get('applicationId') == app_id:
+                                      st = a.get('status') or a.get('state')
+                                      if st and str(st).upper() in ['ACTIVE','AVAILABLE','READY','CREATED','SUCCEEDED']:
+                                          ready = True
+                                          break
+                              if ready:
+                                  break
+                          except Exception as e:
+                              logger.error('get_application/list_applications check failed (attempt %d): %s', w+1, str(e))
+                          time.sleep(2 ** w)
+
+                      if not ready:
+                          logger.warning('Application %s not in ready state after polling; proceeding may fail when creating users', app_id)
+
+                      return app_id
+
+                  except ClientError as e:
+                      logger.error('CreateApplication ClientError (attempt %d) for %s: %s', attempt, display_name, e.response)
+                      # If AccessDenied, give a helpful message and fail fast
+                      err_code = e.response.get('Error', {}).get('Code')
+                      if err_code == 'AccessDeniedException':
+                          msg = e.response.get('Error', {}).get('Message', '')
+                          logger.error('AccessDenied when creating Q application: %s. Hint: ensure the provisioner role has iam:CreateServiceLinkedRole permission and that Q Business is available in this account/region.', msg)
+                          raise
+                  except Exception as e:
+                      logger.error('CreateApplication unexpected error (attempt %d) for %s: %s', attempt, display_name, str(e))
+
+                  if attempt < max_attempts:
+                      time.sleep(2 ** (attempt - 1))
+
+              # If we reach here, all attempts failed; raise a generic error
+              raise RuntimeError(f'Failed to create application {display_name} after {max_attempts} attempts')
+
+          def ensure_user(application_id, user_id):
+              # create_user returns empty dict on success; it's idempotent based on userId
+              max_attempts = 5
+              for attempt in range(1, max_attempts + 1):
+                  try:
+                      q.create_user(applicationId=application_id, userId=user_id)
+                      return user_id
+                  except ClientError as e:
+                      err_code = e.response.get('Error', {}).get('Code')
+                      msg = e.response.get('Error', {}).get('Message', '')
+                      logger.error('CreateUser ClientError (attempt %d) for %s: %s', attempt, user_id, e.response)
+                      # Conflict: often due to application not yet in valid state; wait and retry
+                      if err_code == 'ConflictException' and 'not in a valid state' in msg:
+                          if attempt < max_attempts:
+                              time.sleep(2 ** attempt)
+                              continue
+                      raise
+                  except Exception as e:
+                      logger.error('CreateUser unexpected error (attempt %d) for %s: %s', attempt, user_id, str(e))
+                      if attempt < max_attempts:
+                          time.sleep(2 ** attempt)
+                          continue
+                      raise
+              raise RuntimeError(f'Failed to create user {user_id} after {max_attempts} attempts')
+
+          def handler(event, context):
+              logger.info('Event: %s', json.dumps(event))
+              try:
+                  props = event.get('ResourceProperties', {})
+                  app_name = props.get('ApplicationName')
+                  user_id = props.get('ApplicationUserId')
+                  identity_type = props.get('ApplicationIdentityType', 'ANONYMOUS')
+
+                  # Validate identity type against allowed enum values
+                  allowed_identity_types = ['AWS_IAM_IDP_SAML','AWS_QUICKSIGHT_IDP','ANONYMOUS','AWS_IAM_IDP_OIDC','AWS_IAM_IDC']
+                  identity_type = (identity_type or '').upper()
+                  if identity_type not in allowed_identity_types:
+                      logger.error('Invalid ApplicationIdentityType: %s. Allowed: %s', identity_type, allowed_identity_types)
+                      raise ValueError(f'Invalid ApplicationIdentityType: {identity_type}. Allowed: {allowed_identity_types}')
+
+                  if event['RequestType'] == 'Delete':
+                      # For safety, do not delete resources automatically. Just return success.
+                      send_response(event, context, 'SUCCESS', data={})
+                      return
+
+                  application_id = ensure_application(app_name, identity_type)
+                  alias_user_id = ensure_user(application_id, user_id)
+
+                  data = {
+                      'ApplicationId': application_id,
+                      'UserId': alias_user_id
+                  }
+                  send_response(event, context, 'SUCCESS', data=data)
+              except Exception as e:
+                  logger.error('Provisioner failed: %s', traceback.format_exc())
+                  send_response(event, context, 'FAILED', reason=str(e))
+
+  QProvisionerCustomResource:
+    Type: Custom::QProvisioner
+    Properties:
+      ServiceToken: !GetAtt QProvisionerFunction.Arn
+      ApplicationName: !Ref ApplicationName
+      ApplicationUserId: !Ref ApplicationUserId
+      ApplicationIdentityType: !Ref ApplicationIdentityType
+
+  #AppFunctionQAppBinding:
+  #  Type: AWS::Lambda::Function
+  #  Condition: false
+  # This placeholder demonstrates how you could update AppFunction's env var
+  # with the ApplicationId returned by the custom resource. CloudFormation
+  # currently does not support updating an existing Lambda's environment
+  # with a custom resource in the same stack easily; instead, you can
+  # read the attribute and perform deployments that inject Q_APP_ID.
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the runtime Lambda function
+    Value: !GetAtt AppFunction.Arn
+  QApplicationId:
+    Description: ApplicationId created for Q Business
+    Value: !GetAtt QProvisionerCustomResource.ApplicationId
+  QApplicationUserId:
+    Description: The user id created in the Q application
+    Value: !GetAtt QProvisionerCustomResource.UserId
+
+Metadata:
+  Notes: |
+    Upload your zipped Lambda (containing `main.py` and dependencies) to the
+    S3 bucket/key you pass into the parameters before creating the stack.
+
+    The provisioner Lambda will create the Q application and user with
+    the given DisplayName/UserId. It intentionally does not delete them on
+    stack deletion to avoid accidental data loss.
+
+    The template uses broad service permissions for Bedrock and Q; tighten
+    policies to least privilege in production environments.

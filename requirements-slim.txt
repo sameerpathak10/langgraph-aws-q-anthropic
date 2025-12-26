@@ -1,0 +1,12 @@
+# Minimal runtime requirements inferred from imports in `main.py`.
+# These pins aim to avoid dependency conflicts. If you need newer features, update carefully.
+
+boto3==1.42.16
+# Pin langgraph and matching langchain-core and langsmith versions (known-good set)
+langgraph==1.0.5
+langchain-core==1.2.4
+langsmith==0.5.1
+langchain-aws>=0.1.0
+# Note: this set may still bring compiled binaries; consider using a Lambda Layer for heavy native deps (numpy, pydantic-core) to keep the zip small.
+# If you need additional capabilities, add them explicitly here (e.g., small utility libs).
+# Avoid adding heavy packages (numpy, pandas, zstandard, etc.) if you plan to keep the zip small.

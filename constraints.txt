@@ -1,0 +1,7 @@
+# Conservative constraints to avoid known dependency conflicts
+# Adjust versions if your project requires newer releases.
+anyio<4,>=3.7.1
+numpy<2
+tenacity<9.0.0
+# Remove strict langchain-core/langsmith caps to allow resolver to choose compatible versions
+# Add other constraints as needed

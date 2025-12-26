@@ -1,0 +1,60 @@
+name: Package Lambda (no Docker)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Run packaging script (no Docker, slim)
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          # Run slim packaging targeting linux and fail if >50MB
+          ./scripts/package_lambda.ps1 -RequirementsFile requirements.txt -Slim -TargetPlatform linux -MaxZipSizeMB 50
+
+      - name: Check artifact size and upload
+        run: |
+          FILESIZE=$(stat -c%s langgraph_lambda.zip || echo 0)
+          SIZE_MB=$((FILESIZE / 1024 / 1024))
+          echo "Package size: ${SIZE_MB} MB"
+          if [ "$SIZE_MB" -gt 50 ]; then
+            echo "Artifact exceeds 50MB (${SIZE_MB}MB) - failing workflow"
+            exit 2
+          fi
+        shell: bash
+
+      - name: Upload lambda zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-package
+          path: langgraph_lambda.zip
+
+      - name: Upload build directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-directory
+          path: build
