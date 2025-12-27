@@ -20,6 +20,12 @@ New-Item -ItemType Directory -Path $BuildDir | Out-Null
 
 # Install dependencies into the build dir
 if (Test-Path $RequirementsFile) {
+    $pipPlatformFlags = @()
+    if ($TargetPlatform -eq 'linux') {
+        Write-Host "Targeting Linux: Using pip flags for manylinux2014_x86_64 (Python 3.11)"
+        $pipPlatformFlags = @("--platform", "manylinux2014_x86_64", "--only-binary=:all:", "--implementation", "cp", "--python-version", "3.11")
+    }
+
     if ($Slim.IsPresent) {
         Write-Host "Slim mode requested"
         if (Test-Path $SlimRequirementsFile) {
@@ -28,9 +34,9 @@ if (Test-Path $RequirementsFile) {
             $constraints = "constraints.txt"
             if (Test-Path $constraints) {
                 Write-Host "Applying constraints from $constraints"
-                python -m pip install -r $SlimRequirementsFile -c $constraints -t $BuildDir
+                python -m pip install -r $SlimRequirementsFile -c $constraints -t $BuildDir $pipPlatformFlags
             } else {
-                python -m pip install -r $SlimRequirementsFile -t $BuildDir
+                python -m pip install -r $SlimRequirementsFile -t $BuildDir $pipPlatformFlags
             }
             if ($LASTEXITCODE -ne 0) { Write-Error "pip install for slim requirements failed (exit code $LASTEXITCODE). Aborting packaging."; exit 1 }
         } else {
@@ -38,9 +44,9 @@ if (Test-Path $RequirementsFile) {
             python -m pip install --upgrade pip
             $constraints = "constraints.txt"
             if (Test-Path $constraints) {
-                python -m pip install -r $RequirementsFile -c $constraints -t $BuildDir
+                python -m pip install -r $RequirementsFile -c $constraints -t $BuildDir $pipPlatformFlags
             } else {
-                python -m pip install -r $RequirementsFile -t $BuildDir
+                python -m pip install -r $RequirementsFile -t $BuildDir $pipPlatformFlags
             }
             if ($LASTEXITCODE -ne 0) { Write-Error "pip install for requirements failed (exit code $LASTEXITCODE). Aborting packaging."; exit 1 }
 
@@ -69,9 +75,9 @@ if (Test-Path $RequirementsFile) {
         $constraints = "constraints.txt"
         if (Test-Path $constraints) {
             Write-Host "Applying constraints from $constraints"
-            python -m pip install -r $RequirementsFile -c $constraints -t $BuildDir
+            python -m pip install -r $RequirementsFile -c $constraints -t $BuildDir $pipPlatformFlags
         } else {
-            python -m pip install -r $RequirementsFile -t $BuildDir
+            python -m pip install -r $RequirementsFile -t $BuildDir $pipPlatformFlags
         }
     }
 } else {
@@ -82,7 +88,7 @@ if (Test-Path $RequirementsFile) {
 try { icacls $BuildDir /grant *S-1-1-0:(OI)(CI)F } catch { }
 
 # Debug: list build dir contents to help diagnose missing packages
-Write-Host "Debug: listing top-level items in $BuildDir:"
+Write-Host "Debug: listing top-level items in $BuildDir"
 Get-ChildItem -Path $BuildDir -Force | ForEach-Object { Write-Host "  " + $_.Name }
 Write-Host "Debug: searching for *dist-info and top-level package dirs (first 50 matches):"
 Get-ChildItem -Path $BuildDir -Recurse -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*dist-info' -or $_.Name -match '^[a-zA-Z0-9_\-]+' } | Select-Object -First 50 | ForEach-Object { Write-Host "  " + $_.FullName }

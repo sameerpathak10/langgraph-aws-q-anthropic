@@ -20,7 +20,7 @@ q_client = boto3.client("qbusiness")  # AWS Q Business
 
 # Config (override via env vars)
 Q_APP_ID = os.environ.get("Q_APP_ID", "YOUR_Q_APP_ID")
-Q_USER_ID = os.environ.get("Q_USER_ID", "lambda-user")
+Q_USER_ID = os.environ.get("Q_USER_ID")  # Can be None for anonymous access
 
 # ===============================
 # Claude LLM (Decision + Agents)
@@ -97,11 +97,14 @@ def aws_q_rag(state: AgentState):
         return {"response": "Enterprise search is not configured. Please set Q_APP_ID."}
 
     try:
-        response = q_client.chat_sync(
-            applicationId=Q_APP_ID,
-            userId=Q_USER_ID,
-            userMessage=state["user_input"]
-        )
+        chat_kwargs: Dict[str, Any] = {
+            "applicationId": Q_APP_ID,
+            "userMessage": state["user_input"],
+        }
+        if Q_USER_ID:
+            chat_kwargs["userId"] = Q_USER_ID
+        
+        response = q_client.chat_sync(**chat_kwargs)
     except Exception as e:
         logger.exception("Q service call failed")
         return {"response": f"Error calling Q service: {e}"}

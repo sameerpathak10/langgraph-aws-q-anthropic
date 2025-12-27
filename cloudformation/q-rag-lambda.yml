@@ -78,6 +78,12 @@ Resources:
                   - qbusiness:chat_sync
                   - qbusiness:*
                 Resource: "*"
+              # AWS Marketplace permissions to allow Bedrock to access 3rd party models
+              - Effect: Allow
+                Action:
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Subscribe
+                Resource: "*"
 
   AppFunction:
     Type: AWS::Lambda::Function
@@ -95,7 +101,6 @@ Resources:
       Environment:
         Variables:
           Q_APP_ID: !GetAtt QProvisionerCustomResource.ApplicationId
-          Q_USER_ID: !Ref ApplicationUserId
       Tags:
         - Key: project
           Value: langgraph
