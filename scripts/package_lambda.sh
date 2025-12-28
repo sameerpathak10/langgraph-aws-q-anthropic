@@ -21,11 +21,11 @@ rm -rf "$BUILD"
 mkdir -p "$BUILD"
 
 if [ -f "$REQ" ]; then
+  python -m pip install --upgrade pip
   if [ "$SLIM" = "true" ]; then
     echo "Slim mode requested"
     if [ -f "$SLIM_REQ" ]; then
       echo "Installing SLIM requirements from $SLIM_REQ..."
-      python -m pip install --upgrade pip
       if [ -f constraints.txt ]; then
         echo "Applying constraints from constraints.txt"
         python -m pip install -r "$SLIM_REQ" -c constraints.txt -t "$BUILD"
@@ -38,7 +38,6 @@ if [ -f "$REQ" ]; then
       fi
     else
       echo "No $SLIM_REQ found; installing regular requirements then pruning heavy files..."
-      python -m pip install --upgrade pip
       if [ -f constraints.txt ]; then
         python -m pip install -r "$REQ" -c constraints.txt -t "$BUILD"
       else
@@ -70,10 +69,10 @@ if [ -f "$REQ" ]; then
   else
     echo "Installing dependencies from $REQ..."
     echo "Using local pip to install dependencies..."
-    python -m pip install --upgrade pip
     if [ -f constraints.txt ]; then
       echo "Applying constraints from constraints.txt"
-      python -m pip install -r "$REQ" -c constraints.txt -t "$BUILD"
+      python -m pip install -r "$REQ" -c constraints.txt -t "$BUI
+LD"
     else
       python -m pip install -r "$REQ" -t "$BUILD"
     fi
@@ -84,11 +83,6 @@ if [ -f "$REQ" ]; then
   fi
 else
   echo "No requirements file found ($REQ) - skipping deps"
-fi
-
-# Attempt to set ownership of build dir to current user (best-effort)
-if [ -d "$BUILD" ]; then
-  sudo chown -R $(id -u):$(id -g) "$BUILD" 2>/dev/null || true
 fi
 
 # Validate required modules are present (fail fast if missing)

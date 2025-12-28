@@ -21,12 +21,13 @@ q_client = boto3.client("qbusiness")  # AWS Q Business
 # Config (override via env vars)
 Q_APP_ID = os.environ.get("Q_APP_ID", "YOUR_Q_APP_ID")
 Q_USER_ID = os.environ.get("Q_USER_ID")  # Can be None for anonymous access
+CLAUDE_MODEL_ID = os.environ.get("CLAUDE_MODEL_ID", "anthropic.claude-3-sonnet-20240229-v1:0")
 
 # ===============================
 # Claude LLM (Decision + Agents)
 # ===============================
 llm = ChatBedrock(
-    model_id="anthropic.claude-3-sonnet-20240229-v1:0",
+    model_id=CLAUDE_MODEL_ID,
     client=bedrock,
     model_kwargs={"temperature": 0}
 )
@@ -110,17 +111,10 @@ def aws_q_rag(state: AgentState):
         return {"response": f"Error calling Q service: {e}"}
 
     # Parse response defensively
-    answer = None
-    if isinstance(response, dict):
-        for key in ("systemMessage", "message", "response", "content"):
-            if key in response and response[key]:
-                answer = response[key]
-                break
-        if answer is None and response.get("messages"):
-            first = response["messages"][0]
-            if isinstance(first, dict):
-                answer = first.get("content") or first.get("message")
-    if answer is None:
+    answer = response.get("systemMessage")
+
+    if not answer:
+        logger.warning("No 'systemMessage' in Q response, returning full response")
         answer = json.dumps(response)
 
     return {"response": answer}
