@@ -1,15 +1,14 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Creates a Lambda for RAG/LLM routing using the provided `main.py` handler,
-  and provisions an Amazon Q Business Application and User via a Lambda-backed
-  custom resource. Grants the Lambda permissions to call Amazon Q Business
-  and Amazon Bedrock runtime (broad permissions can be tightened later).
+  and provisions a complete Amazon Q Business Application, Index, Retriever,
+  and S3 Data Source via a Lambda-backed custom resource.
 
 Parameters:
   LambdaS3Bucket:
     Type: String
     Default: langgraph-poc-bucket
-    Description: S3 bucket that contains the ZIP package for the main Lambda (code).
+    Description: S3 bucket containing the ZIP package for the main application Lambda.
   LambdaS3Key:
     Type: String
     Description: S3 key for the ZIP package (e.g., langgraph_lambda.zip).
@@ -17,19 +16,27 @@ Parameters:
   LambdaFunctionName:
     Type: String
     Default: langgraph-rag-lambda
-    Description: Lambda function name
+    Description: Lambda function name for the main application.
   ApplicationName:
     Type: String
     Default: LangGraphQApp
-    Description: Display name of the Amazon Q Business application to create
-  ApplicationUserId:
+    Description: Display name of the Amazon Q Business application to create.
+  IndexDisplayName:
     Type: String
-    Default: lambda-user
-    Description: User id (external id/email) to create in the Q application
+    Default: LangGraphQIndex
+    Description: Display name for the Amazon Q Business index.
+  DataSourceName:
+    Type: String
+    Default: LangGraphS3DataSource
+    Description: Display name for the Amazon Q S3 data source.
+  DataSourceBucketName:
+    Type: String
+    Default: ""
+    Description: (Optional) Name of an existing S3 bucket to use as the data source. If empty, a new bucket will be created.
   ApplicationIdentityType:
     Type: String
     Default: ANONYMOUS
-    Description: Identity type to use when creating the Q application. Allowed values AWS_IAM_IDP_SAML, AWS_QUICKSIGHT_IDP, ANONYMOUS, AWS_IAM_IDP_OIDC, AWS_IAM_IDC
+    Description: Identity type for the Q application. ANONYMOUS is required for this sample.
   Runtime:
     Type: String
     Default: python3.11
@@ -44,10 +51,8 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
+              Service: [lambda.amazonaws.com]
+            Action: [sts:AssumeRole]
       Path: /
       Policies:
         - PolicyName: LambdaBasic
@@ -64,21 +69,14 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # Amazon Bedrock runtime invocation (broad; tighten to least privilege later)
               - Effect: Allow
                 Action:
-                  - bedrock-runtime:InvokeModel
-                  - bedrock-runtime:InvokeModelWithResponseStream
                   - bedrock:InvokeModel
-                Resource: "*"
-              # Amazon Q Business chat access for runtime (broad)
+                Resource: "arn:aws:bedrock:*::foundation-model/*"
               - Effect: Allow
                 Action:
                   - qbusiness:ChatSync
-                  - qbusiness:chat_sync
-                  - qbusiness:*
-                Resource: "*"
-              # AWS Marketplace permissions to allow Bedrock to access 3rd party models
+                Resource: !GetAtt QProvisionerCustomResource.ApplicationArn
               - Effect: Allow
                 Action:
                   - aws-marketplace:ViewSubscriptions
@@ -101,6 +99,7 @@ Resources:
       Environment:
         Variables:
           Q_APP_ID: !GetAtt QProvisionerCustomResource.ApplicationId
+          Q_RETRIEVER_ID: !GetAtt QProvisionerCustomResource.RetrieverId
       Tags:
         - Key: project
           Value: langgraph
@@ -113,10 +112,8 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
+              Service: [lambda.amazonaws.com]
+            Action: [sts:AssumeRole]
       Path: /
       Policies:
         - PolicyName: QProvisionerPolicy
@@ -134,13 +131,27 @@ Resources:
                   - qbusiness:CreateApplication
                   - qbusiness:ListApplications
                   - qbusiness:GetApplication
-                  - qbusiness:CreateUser
-                  - qbusiness:GetUser
-                  - qbusiness:ListUsers
+                  - qbusiness:CreateIndex
+                  - qbusiness:ListIndices
+                  - qbusiness:GetIndex
+                  - qbusiness:CreateDataSource
+                  - qbusiness:ListDataSources
+                  - qbusiness:GetDataSource
+                  - qbusiness:StartDataSourceSyncJob
+                  - qbusiness:ListDataSourcesSyncJobs
+                  - qbusiness:CreateRetriever
+                  - qbusiness:ListRetrievers
+                  - qbusiness:GetRetriever
+                  - s3:CreateBucket
+                  - s3:HeadBucket
+                  - s3:PutBucketPolicy
+                  - iam:CreateRole
+                  - iam:GetRole
+                  - iam:PutRolePolicy
+                  - iam:PassRole
                 Resource: "*"
               - Effect: Allow
-                Action:
-                  - iam:CreateServiceLinkedRole
+                Action: iam:CreateServiceLinkedRole
                 Resource: "*"
                 Condition:
                   StringEquals:
@@ -153,166 +164,220 @@ Resources:
       Handler: index.handler
       Role: !GetAtt QProvisionerRole.Arn
       Runtime: python3.11
-      Timeout: 300
+      Timeout: 900
       MemorySize: 256
       Code:
         ZipFile: |
           import json
           import boto3
           import urllib.request
-          import urllib.error
+          import time
           import logging
           import traceback
+          from botocore.exceptions import ClientError
 
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
 
           q = boto3.client('qbusiness')
+          iam = boto3.client('iam')
+          s3 = boto3.client('s3')
 
           def send_response(event, context, status, data=None, reason=None):
-              resp = {
+              payload = {
                   'Status': status,
-                  'Reason': reason or '',
-                  'PhysicalResourceId': context.log_stream_name if context else 'q-provisioner',
-                  'StackId': event.get('StackId'),
-                  'RequestId': event.get('RequestId'),
-                  'LogicalResourceId': event.get('LogicalResourceId'),
-                  'Data': data or {}
+                  'Reason': reason or f"See CloudWatch Log Stream: {context.log_stream_name}",
+                  'PhysicalResourceId': data.get('ApplicationId', context.log_stream_name),
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data,
               }
-              body = json.dumps(resp).encode('utf-8')
-              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT')
-              req.add_header('Content-Type', '')
-              req.add_header('Content-Length', str(len(body)))
+              logger.info(f"Sending response: {json.dumps(payload)}")
               try:
-                  urllib.request.urlopen(req)
-              except Exception as e:
-                  logger.exception('Failed to send CFN response')
+                  body = json.dumps(payload).encode('utf-8')
+                  req = urllib.request.Request(event['ResponseURL'], data=body, headers={'Content-Type': '', 'Content-Length': len(body)}, method='PUT')
+                  with urllib.request.urlopen(req) as resp:
+                      logger.info(f"Response status: {resp.status}")
+              except Exception:
+                  logger.exception("Failed to send CFN response")
 
-          import time
-          from botocore.exceptions import ClientError
+          def wait_for_status(check_function, expected_status='ACTIVE', max_attempts=40, delay=15):
+              for i in range(max_attempts):
+                  status, resource_id = check_function()
+                  logger.info(f"Checking status for {resource_id}: current status is {status} (Attempt {i+1}/{max_attempts})")
+                  if status == expected_status:
+                      return resource_id
+                  if status in ['FAILED', 'ERROR']:
+                      raise Exception(f"Resource {resource_id} entered FAILED state.")
+                  time.sleep(delay)
+              raise Exception(f"Resource did not reach {expected_status} state after {max_attempts * delay} seconds.")
 
-          def ensure_application(display_name, identity_type='ANONYMOUS'):
-              # Validate input
-              if not display_name:
-                  raise ValueError('ApplicationName must be provided')
-
-              # Try to find an existing application
+          def ensure_application(display_name, identity_type):
               resp = q.list_applications()
-              items = resp.get('applications', [])
-              for a in items:
-                  if a.get('displayName') == display_name:
-                      return a['applicationId']
+              for app in resp.get('applications', []):
+                  if app.get('displayName') == display_name:
+                      logger.info(f"Found existing application: {app['applicationId']}")
+                      return app['applicationId']
+              
+              logger.info(f"Creating application '{display_name}'...")
+              resp = q.create_application(displayName=display_name, identityType=identity_type)
+              app_id = resp['applicationId']
 
-              # Not found -> create. Use provided identity_type; implement retries and detailed logging.
-              max_attempts = 3
-              for attempt in range(1, max_attempts + 1):
-                  try:
-                      resp = q.create_application(displayName=display_name, identityType=identity_type)
-                      app_id = resp.get('applicationId')
+              def check_app_status():
+                  app_details = q.get_application(applicationId=app_id)
+                  return app_details.get('status', 'CREATING'), app_id
+              
+              return wait_for_status(check_app_status)
 
-                      # Wait for the application to become ready before returning (poll get_application)
-                      ready = False
-                      wait_attempts = 8
-                      for w in range(wait_attempts):
-                          try:
-                              app_resp = q.get_application(applicationId=app_id)
-                              logger.info('get_application response (attempt %d): %s', w+1, app_resp)
-                              # Try common fields for status/state
-                              status = app_resp.get('status') or (app_resp.get('application') or {}).get('status') or (app_resp.get('application') or {}).get('state')
-                              if status and str(status).upper() in ['ACTIVE','AVAILABLE','READY','CREATED','SUCCEEDED']:
-                                  ready = True
-                                  break
-                              # Fallback: inspect list_applications
-                              apps = q.list_applications()
-                              for a in apps.get('applications', []):
-                                  if a.get('applicationId') == app_id:
-                                      st = a.get('status') or a.get('state')
-                                      if st and str(st).upper() in ['ACTIVE','AVAILABLE','READY','CREATED','SUCCEEDED']:
-                                          ready = True
-                                          break
-                              if ready:
-                                  break
-                          except Exception as e:
-                              logger.error('get_application/list_applications check failed (attempt %d): %s', w+1, str(e))
-                          time.sleep(2 ** w)
+          def ensure_index(app_id, display_name):
+              resp = q.list_indices(applicationId=app_id)
+              for index in resp.get('indices', []):
+                  if index.get('displayName') == display_name:
+                      logger.info(f"Found existing index: {index['indexId']}")
+                      return index['indexId']
 
-                      if not ready:
-                          logger.warning('Application %s not in ready state after polling; proceeding may fail when creating users', app_id)
+              logger.info(f"Creating index '{display_name}'...")
+              resp = q.create_index(applicationId=app_id, displayName=display_name)
+              index_id = resp['indexId']
+              
+              def check_index_status():
+                  index_details = q.get_index(applicationId=app_id, indexId=index_id)
+                  return index_details.get('status', 'CREATING'), index_id
+              
+              return wait_for_status(check_index_status)
 
-                      return app_id
-
-                  except ClientError as e:
-                      logger.error('CreateApplication ClientError (attempt %d) for %s: %s', attempt, display_name, e.response)
-                      # If AccessDenied, give a helpful message and fail fast
-                      err_code = e.response.get('Error', {}).get('Code')
-                      if err_code == 'AccessDeniedException':
-                          msg = e.response.get('Error', {}).get('Message', '')
-                          logger.error('AccessDenied when creating Q application: %s. Hint: ensure the provisioner role has iam:CreateServiceLinkedRole permission and that Q Business is available in this account/region.', msg)
-                          raise
-                  except Exception as e:
-                      logger.error('CreateApplication unexpected error (attempt %d) for %s: %s', attempt, display_name, str(e))
-
-                  if attempt < max_attempts:
-                      time.sleep(2 ** (attempt - 1))
-
-              # If we reach here, all attempts failed; raise a generic error
-              raise RuntimeError(f'Failed to create application {display_name} after {max_attempts} attempts')
-
-          def ensure_user(application_id, user_id):
-              # create_user returns empty dict on success; it's idempotent based on userId
-              max_attempts = 5
-              for attempt in range(1, max_attempts + 1):
-                  try:
-                      q.create_user(applicationId=application_id, userId=user_id)
-                      return user_id
-                  except ClientError as e:
-                      err_code = e.response.get('Error', {}).get('Code')
-                      msg = e.response.get('Error', {}).get('Message', '')
-                      logger.error('CreateUser ClientError (attempt %d) for %s: %s', attempt, user_id, e.response)
-                      # Conflict: often due to application not yet in valid state; wait and retry
-                      if err_code == 'ConflictException' and 'not in a valid state' in msg:
-                          if attempt < max_attempts:
-                              time.sleep(2 ** attempt)
-                              continue
+          def ensure_data_source_role(role_name, bucket_name):
+              try:
+                  role_resp = iam.get_role(RoleName=role_name)
+                  role_arn = role_resp['Role']['Arn']
+                  logger.info(f"Found existing role {role_name}")
+              except ClientError as e:
+                  if e.response['Error']['Code'] == 'NoSuchEntityException':
+                      logger.info(f"Creating role {role_name}...")
+                      assume_role_policy = {
+                          "Version": "2012-10-17",
+                          "Statement": [{"Effect": "Allow", "Principal": {"Service": "qbusiness.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+                      }
+                      create_resp = iam.create_role(RoleName=role_name, AssumeRolePolicyDocument=json.dumps(assume_role_policy))
+                      role_arn = create_resp['Role']['Arn']
+                      time.sleep(10) # Give role time to propagate
+                  else:
                       raise
-                  except Exception as e:
-                      logger.error('CreateUser unexpected error (attempt %d) for %s: %s', attempt, user_id, str(e))
-                      if attempt < max_attempts:
-                          time.sleep(2 ** attempt)
-                          continue
-                      raise
-              raise RuntimeError(f'Failed to create user {user_id} after {max_attempts} attempts')
+
+              logger.info(f"Attaching policy to role {role_name}")
+              policy_doc = {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                      {"Effect": "Allow", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{bucket_name}/*"},
+                      {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": f"arn:aws:s3:::{bucket_name}"}
+                  ]
+              }
+              iam.put_role_policy(RoleName=role_name, PolicyName='QDataSourceS3Policy', PolicyDocument=json.dumps(policy_doc))
+              return role_arn
+
+          def ensure_data_source(app_id, index_id, role_arn, bucket_name, ds_name):
+              resp = q.list_data_sources(applicationId=app_id, indexId=index_id)
+              for ds in resp.get('dataSources', []):
+                  if ds.get('displayName') == ds_name:
+                      logger.info(f"Found existing data source: {ds['dataSourceId']}")
+                      return ds['dataSourceId']
+
+              logger.info(f"Creating data source '{ds_name}'...")
+              config = {"s3": {"bucketName": bucket_name}}
+              resp = q.create_data_source(
+                  applicationId=app_id,
+                  indexId=index_id,
+                  displayName=ds_name,
+                  configuration=config,
+                  roleArn=role_arn
+              )
+              ds_id = resp['dataSourceId']
+              
+              def check_ds_status():
+                  ds_details = q.get_data_source(applicationId=app_id, indexId=index_id, dataSourceId=ds_id)
+                  return ds_details.get('status', 'CREATING'), ds_id
+
+              return wait_for_status(check_ds_status)
+
+          def start_sync(app_id, index_id, ds_id):
+              syncs = q.list_data_source_sync_jobs(applicationId=app_id, indexId=index_id, dataSourceId=ds_id)
+              # Only start a sync if one has never been run
+              if not syncs.get('history'):
+                  logger.info(f"Starting initial sync for data source {ds_id}")
+                  q.start_data_source_sync_job(applicationId=app_id, indexId=index_id, dataSourceId=ds_id)
+              else:
+                  logger.info("Sync job history already exists. Skipping initial sync.")
+
+          def ensure_retriever(app_id, index_id, display_name):
+              resp = q.list_retrievers(applicationId=app_id)
+              for r in resp.get('retrievers', []):
+                  if r.get('displayName') == display_name:
+                      logger.info(f"Found existing retriever: {r['retrieverId']}")
+                      return r['retrieverId']
+              
+              logger.info("Creating retriever...")
+              config = {
+                  "nativeIndexConfiguration": {
+                      "indexId": index_id
+                  }
+              }
+              resp = q.create_retriever(applicationId=app_id, displayName=display_name, type='NATIVE_INDEX', configuration=config)
+              retriever_id = resp['retrieverId']
+
+              def check_retriever_status():
+                  retriever_details = q.get_retriever(applicationId=app_id, retrieverId=retriever_id)
+                  return retriever_details.get('status', 'CREATING'), retriever_id
+              
+              return wait_for_status(check_retriever_status, expected_status='ACTIVE')
 
           def handler(event, context):
-              logger.info('Event: %s', json.dumps(event))
+              props = event.get('ResourceProperties', {})
+              logger.info(f"Received event: {json.dumps(event)}")
+              
+              if event['RequestType'] == 'Delete':
+                  # For safety, do not delete Q resources on stack deletion.
+                  send_response(event, context, 'SUCCESS', {})
+                  return
+
               try:
-                  props = event.get('ResourceProperties', {})
-                  app_name = props.get('ApplicationName')
-                  user_id = props.get('ApplicationUserId')
-                  identity_type = props.get('ApplicationIdentityType', 'ANONYMOUS')
+                  account_id = context.invoked_function_arn.split(":")[4]
+                  region = context.invoked_function_arn.split(":")[3]
+                  
+                  app_id = ensure_application(props['ApplicationName'], props['ApplicationIdentityType'])
+                  index_id = ensure_index(app_id, props['IndexDisplayName'])
+                  
+                  bucket_name = props.get('DataSourceBucketName') or f"q-ds-bucket-{account_id}-{region}-{app_id[:8]}"
+                  try:
+                      s3.head_bucket(Bucket=bucket_name)
+                      logger.info(f"Bucket {bucket_name} already exists.")
+                  except ClientError:
+                      logger.info(f"Creating bucket {bucket_name}")
+                      if region != 'us-east-1':
+                          s3.create_bucket(Bucket=bucket_name, CreateBucketConfiguration={'LocationConstraint': region})
+                      else:
+                          s3.create_bucket(Bucket=bucket_name)
 
-                  # Validate identity type against allowed enum values
-                  allowed_identity_types = ['AWS_IAM_IDP_SAML','AWS_QUICKSIGHT_IDP','ANONYMOUS','AWS_IAM_IDP_OIDC','AWS_IAM_IDC']
-                  identity_type = (identity_type or '').upper()
-                  if identity_type not in allowed_identity_types:
-                      logger.error('Invalid ApplicationIdentityType: %s. Allowed: %s', identity_type, allowed_identity_types)
-                      raise ValueError(f'Invalid ApplicationIdentityType: {identity_type}. Allowed: {allowed_identity_types}')
-
-                  if event['RequestType'] == 'Delete':
-                      # For safety, do not delete resources automatically. Just return success.
-                      send_response(event, context, 'SUCCESS', data={})
-                      return
-
-                  application_id = ensure_application(app_name, identity_type)
-                  alias_user_id = ensure_user(application_id, user_id)
-
+                  role_name = f"QDataSourceRole-{app_id[:8]}-{index_id[:8]}"
+                  role_arn = ensure_data_source_role(role_name, bucket_name)
+                  
+                  ds_id = ensure_data_source(app_id, index_id, role_arn, bucket_name, props['DataSourceName'])
+                  start_sync(app_id, index_id, ds_id)
+                  
+                  retriever_id = ensure_retriever(app_id, index_id, "QAppRetriever")
+                  
                   data = {
-                      'ApplicationId': application_id,
-                      'UserId': alias_user_id
+                      'ApplicationId': app_id,
+                      'ApplicationArn': f"arn:aws:qbusiness:{region}:{account_id}:application/{app_id}",
+                      'IndexId': index_id,
+                      'RetrieverId': retriever_id,
+                      'DataSourceId': ds_id,
+                      'DataSourceBucketName': bucket_name,
                   }
-                  send_response(event, context, 'SUCCESS', data=data)
+                  send_response(event, context, 'SUCCESS', data)
+
               except Exception as e:
-                  logger.error('Provisioner failed: %s', traceback.format_exc())
+                  logger.exception("Provisioner failed")
                   send_response(event, context, 'FAILED', reason=str(e))
 
   QProvisionerCustomResource:
@@ -320,37 +385,34 @@ Resources:
     Properties:
       ServiceToken: !GetAtt QProvisionerFunction.Arn
       ApplicationName: !Ref ApplicationName
-      ApplicationUserId: !Ref ApplicationUserId
+      IndexDisplayName: !Ref IndexDisplayName
+      DataSourceName: !Ref DataSourceName
+      DataSourceBucketName: !Ref DataSourceBucketName
       ApplicationIdentityType: !Ref ApplicationIdentityType
-
-  #AppFunctionQAppBinding:
-  #  Type: AWS::Lambda::Function
-  #  Condition: false
-  # This placeholder demonstrates how you could update AppFunction's env var
-  # with the ApplicationId returned by the custom resource. CloudFormation
-  # currently does not support updating an existing Lambda's environment
-  # with a custom resource in the same stack easily; instead, you can
-  # read the attribute and perform deployments that inject Q_APP_ID.
 
 Outputs:
   LambdaFunctionArn:
     Description: ARN of the runtime Lambda function
     Value: !GetAtt AppFunction.Arn
   QApplicationId:
-    Description: ApplicationId created for Q Business
+    Description: ApplicationId for the created Amazon Q Business application
     Value: !GetAtt QProvisionerCustomResource.ApplicationId
-  QApplicationUserId:
-    Description: The user id created in the Q application
-    Value: !GetAtt QProvisionerCustomResource.UserId
-
+  QIndexId:
+    Description: IndexId for the created Amazon Q Business index
+    Value: !GetAtt QProvisionerCustomResource.IndexId
+  QRetrieverId:
+    Description: RetrieverId for the created Amazon Q Business retriever
+    Value: !GetAtt QProvisionerCustomResource.RetrieverId
+  QDataSourceId:
+    Description: DataSourceId for the created Amazon Q Business data source
+    Value: !GetAtt QProvisionerCustomResource.DataSourceId
+  QDataSourceBucketName:
+    Description: S3 bucket name for the data source
+    Value: !GetAtt QProvisionerCustomResource.DataSourceBucketName
 Metadata:
   Notes: |
-    Upload your zipped Lambda (containing `main.py` and dependencies) to the
-    S3 bucket/key you pass into the parameters before creating the stack.
-
-    The provisioner Lambda will create the Q application and user with
-    the given DisplayName/UserId. It intentionally does not delete them on
-    stack deletion to avoid accidental data loss.
-
-    The template uses broad service permissions for Bedrock and Q; tighten
-    policies to least privilege in production environments.
+    Before creating the stack, do two things:
+    1. Upload your zipped Lambda (containing `main.py` and dependencies) to the
+       S3 bucket/key you pass as parameters.
+    2. Go to the Amazon Bedrock console in the target region and request access to
+       the 'Anthropic Claude 3 Sonnet' model if you haven't already.

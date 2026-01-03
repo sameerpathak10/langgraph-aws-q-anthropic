@@ -9,8 +9,9 @@ param(
     [Parameter(Mandatory=$true)][string]$TemplateFile,
     [Parameter(Mandatory=$true)][string]$LambdaS3Bucket,
     [Parameter(Mandatory=$true)][string]$LambdaS3Key,
-    [string]$ChangeSetPrefix = "inject-qappid",
-    [switch]$AutoDeleteFailedChangeSet
+    [string]$ChangeSetPrefix = "update",
+    [switch]$AutoDeleteFailedChangeSet,
+    [string[]]$Parameters = @()
 )
 
 function Ensure-AwsCli {
@@ -77,6 +78,7 @@ try {
         '--capabilities', 'CAPABILITY_NAMED_IAM',
         '--parameters', "ParameterKey=LambdaS3Bucket,ParameterValue=$LambdaS3Bucket", "ParameterKey=LambdaS3Key,ParameterValue=$LambdaS3Key"
     )
+    $createArgs += $Parameters
 
     $createResult = aws @createArgs 2>&1
     if ($LASTEXITCODE -ne 0) {

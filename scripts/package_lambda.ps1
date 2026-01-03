@@ -20,6 +20,9 @@ New-Item -ItemType Directory -Path $BuildDir | Out-Null
 
 # Install dependencies into the build dir
 if (Test-Path $RequirementsFile) {
+    python -m pip install --upgrade pip
+    if ($LASTEXITCODE -ne 0) { Write-Warning "pip upgrade failed, proceeding anyway..." }
+
     $pipPlatformFlags = @()
     if ($TargetPlatform -eq 'linux') {
         Write-Host "Targeting Linux: Using pip flags for manylinux2014_x86_64 (Python 3.11)"
@@ -30,7 +33,6 @@ if (Test-Path $RequirementsFile) {
         Write-Host "Slim mode requested"
         if (Test-Path $SlimRequirementsFile) {
             Write-Host "Installing SLIM requirements from $SlimRequirementsFile..."
-            python -m pip install --upgrade pip
             $constraints = "constraints.txt"
             if (Test-Path $constraints) {
                 Write-Host "Applying constraints from $constraints"
@@ -41,7 +43,6 @@ if (Test-Path $RequirementsFile) {
             if ($LASTEXITCODE -ne 0) { Write-Error "pip install for slim requirements failed (exit code $LASTEXITCODE). Aborting packaging."; exit 1 }
         } else {
             Write-Host "No $SlimRequirementsFile found; installing regular requirements then pruning heavy files..."
-            python -m pip install --upgrade pip
             $constraints = "constraints.txt"
             if (Test-Path $constraints) {
                 python -m pip install -r $RequirementsFile -c $constraints -t $BuildDir $pipPlatformFlags
@@ -71,7 +72,6 @@ if (Test-Path $RequirementsFile) {
     } else {
         Write-Host "Installing dependencies from $RequirementsFile..."
         Write-Host "Using local pip to install dependencies..."
-        python -m pip install --upgrade pip
         $constraints = "constraints.txt"
         if (Test-Path $constraints) {
             Write-Host "Applying constraints from $constraints"
